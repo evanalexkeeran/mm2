@@ -1,7 +1,5 @@
 local Players = game:GetService("Players")
 
-local Roles = {}
-
 local ROLE = table.freeze({
 	Murderer = "Murderer",
 	Sheriff = "Sheriff",
@@ -16,12 +14,17 @@ local Config = {
 }
 
 local State = {
-	Running = false,
 	Roles = {},
 	Connections = {},
 	Listeners = {},
-	NextListenerId = 0
+	Running = false,
+	ListenerId = 0,
+	Scanner = nil,
+	PlayerAdded = nil,
+	PlayerRemoving = nil
 }
+
+local API = {}
 
 local function isPlayer(player)
 	return typeof(player) == "Instance"
@@ -30,10 +33,6 @@ local function isPlayer(player)
 end
 
 local function findTool(player, name)
-	if not player then
-		return nil
-	end
-
 	local character = player.Character
 	local backpack = player:FindFirstChildOfClass("Backpack")
 
@@ -52,15 +51,13 @@ local function findTool(player, name)
 			return tool
 		end
 	end
-
-	return nil
 end
 
 local function hasTool(player, name)
 	return findTool(player, name) ~= nil
 end
 
-local function detect(player)
+local function defaultDetector(player)
 	if not isPlayer(player) then
 		return ROLE.Unknown
 	end
@@ -76,7 +73,21 @@ local function detect(player)
 	return ROLE.Innocent
 end
 
-local function fireChanged(player, newRole, oldRole)
+local function detect(player)
+	local detector = API.Detector
+
+	if detector then
+		local success, role = pcall(detector, player)
+
+		if success and role ~= nil then
+			return role
+		end
+	end
+
+	return defaultDetector(player)
+end
+
+local function emit(player, newRole, oldRole)
 	if newRole == oldRole then
 		return
 	end
@@ -98,7 +109,7 @@ local function update(player)
 
 	State.Roles[player] = newRole
 
-	fireChanged(player, newRole, oldRole)
+	emit(player, newRole, oldRole)
 
 	return newRole
 end
@@ -116,7 +127,7 @@ local function disconnectPlayer(player)
 	State.Roles[player] = nil
 end
 
-local function refreshPlayer(player)
+local function refresh(player)
 	if isPlayer(player) then
 		task.defer(update, player)
 	end
@@ -129,18 +140,24 @@ local function connectPlayer(player)
 
 	local connections = {}
 
-	local function refresh()
-		refreshPlayer(player)
-	end
+	connections[#connections + 1] = player.CharacterAdded:Connect(function()
+		refresh(player)
+	end)
 
-	connections[#connections + 1] = player.CharacterAdded:Connect(refresh)
-	connections[#connections + 1] = player.CharacterRemoving:Connect(refresh)
+	connections[#connections + 1] = player.CharacterRemoving:Connect(function()
+		refresh(player)
+	end)
 
 	local backpack = player:FindFirstChildOfClass("Backpack")
 
 	if backpack then
-		connections[#connections + 1] = backpack.ChildAdded:Connect(refresh)
-		connections[#connections + 1] = backpack.ChildRemoved:Connect(refresh)
+		connections[#connections + 1] = backpack.ChildAdded:Connect(function()
+			refresh(player)
+		end)
+
+		connections[#connections + 1] = backpack.ChildRemoved:Connect(function()
+			refresh(player)
+		end)
 	end
 
 	State.Connections[player] = connections
@@ -154,7 +171,7 @@ local function refreshAll()
 	end
 end
 
-function Roles.Get(player)
+function API.Get(player)
 	if player == nil then
 		local result = {}
 
@@ -174,14 +191,14 @@ function Roles.Get(player)
 	return State.Roles[player] or detect(player)
 end
 
-function Roles.Is(player, role)
-	return Roles.Get(player) == role
+function API.Is(player, role)
+	return API.Get(player) == role
 end
 
-function Roles.GetPlayers(role)
+function API.GetPlayers(role)
 	local result = {}
 
-	if role == nil then
+	if not role then
 		return result
 	end
 
@@ -194,27 +211,15 @@ function Roles.GetPlayers(role)
 	return result
 end
 
-function Roles.GetMurderer()
-	for player, role in pairs(State.Roles) do
-		if isPlayer(player) and role == ROLE.Murderer then
-			return player
-		end
-	end
-
-	return nil
+function API.GetMurderer()
+	return API.GetPlayers(ROLE.Murderer)[1]
 end
 
-function Roles.GetSheriff()
-	for player, role in pairs(State.Roles) do
-		if isPlayer(player) and role == ROLE.Sheriff then
-			return player
-		end
-	end
-
-	return nil
+function API.GetSheriff()
+	return API.GetPlayers(ROLE.Sheriff)[1]
 end
 
-function Roles.Count(role)
+function API.Count(role)
 	local count = 0
 
 	for player, currentRole in pairs(State.Roles) do
@@ -226,30 +231,20 @@ function Roles.Count(role)
 	return count
 end
 
-function Roles.Refresh(player)
-	if player then
-		return update(player)
-	end
-
-	refreshAll()
-
-	return Roles
-end
-
-function Roles.OnChanged(callback)
+function API.OnChanged(callback)
 	assert(
 		type(callback) == "function",
-		"Roles.OnChanged(callback): callback must be a function"
+		"RoleAPI: callback must be a function"
 	)
 
-	State.NextListenerId += 1
+	State.ListenerId += 1
 
-	local id = State.NextListenerId
+	local id = State.ListenerId
 
 	local connection = {
 		Id = id,
-		Connected = true,
-		Callback = callback
+		Callback = callback,
+		Connected = true
 	}
 
 	State.Listeners[id] = connection
@@ -266,9 +261,19 @@ function Roles.OnChanged(callback)
 	return connection
 end
 
-function Roles.Configure(options)
+function API.Refresh(player)
+	if player then
+		return update(player)
+	end
+
+	refreshAll()
+
+	return API
+end
+
+function API.Configure(options)
 	if type(options) ~= "table" then
-		return Roles
+		return API
 	end
 
 	for key, value in pairs(options) do
@@ -279,16 +284,33 @@ function Roles.Configure(options)
 
 	refreshAll()
 
-	return Roles
+	return API
 end
 
-function Roles.GetConfig()
+function API.GetConfig()
 	return table.clone(Config)
 end
 
-function Roles.Start()
+function API.SetDetector(detector)
+	assert(
+		type(detector) == "function",
+		"RoleAPI: detector must be a function"
+	)
+
+	API.Detector = detector
+
+	refreshAll()
+
+	return API
+end
+
+function API.Detect(player)
+	return detect(player)
+end
+
+function API.Start()
 	if State.Running then
-		return Roles
+		return API
 	end
 
 	State.Running = true
@@ -310,12 +332,12 @@ function Roles.Start()
 		end
 	end)
 
-	return Roles
+	return API
 end
 
-function Roles.Stop()
+function API.Stop()
 	if not State.Running then
-		return Roles
+		return API
 	end
 
 	State.Running = false
@@ -336,11 +358,11 @@ function Roles.Stop()
 
 	State.Scanner = nil
 
-	return Roles
+	return API
 end
 
-function Roles.Destroy()
-	Roles.Stop()
+function API.Destroy()
+	API.Stop()
 
 	for id in pairs(State.Listeners) do
 		State.Listeners[id] = nil
@@ -349,49 +371,34 @@ function Roles.Destroy()
 	table.clear(State.Roles)
 	table.clear(State.Connections)
 
-	return nil
+	API.Detector = nil
 end
 
-function Roles.SetDetector(detector)
-	assert(
-		type(detector) == "function",
-		"Roles.SetDetector(detector): detector must be a function"
-	)
+API.Role = ROLE
+API.Roles = ROLE
 
-	Roles._Detector = detector
-	refreshAll()
+API.GetRole = API.Get
+API.GetAll = API.Get
+API.GetAllByRole = API.GetPlayers
 
-	return Roles
-end
-
-function Roles.Detect(player)
-	if Roles._Detector then
-		local success, result = pcall(Roles._Detector, player)
-
-		if success and result then
-			return result
+setmetatable(API, {
+	__call = function(_, value)
+		if type(value) == "function" then
+			return API.OnChanged(value)
 		end
+
+		if typeof(value) == "Instance" and value:IsA("Player") then
+			return API.Get(value)
+		end
+
+		if type(value) == "string" then
+			return API.GetPlayers(value)
+		end
+
+		return API.Get()
 	end
+})
 
-	return detect(player)
-end
+API.Start()
 
-function Roles.GetRole(player)
-	return Roles.Get(player)
-end
-
-function Roles.GetAll()
-	return Roles.Get()
-end
-
-function Roles.GetAllByRole(role)
-	return Roles.GetPlayers(role)
-end
-
-Roles.Role = ROLE
-Roles.Roles = ROLE
-
-Roles.Start()
-
-return Roles
-
+return API
